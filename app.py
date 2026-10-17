@@ -54,18 +54,27 @@ def otp_protected_response(result):
 
 
 def activation_has_sms(act):
-    """Only count an actual delivered SMS payload, not a placeholder entry."""
+    """Count delivered SMS only, never waiting/status/placeholder messages."""
     sms = act.get('sms')
     entries = sms if isinstance(sms, list) else [sms]
-    empty = {'', 'none', 'null', 'waiting', 'pending', 'no sms', 'no otp',
-             'waiting for the first sms', 'not received', 'false'}
     for entry in entries:
-        if isinstance(entry, dict):
-            for field in ('sms', 'text', 'message', 'body', 'code', 'otp'):
-                value = entry.get(field)
-                if isinstance(value, (str, int)) and str(value).strip().lower() not in empty:
-                    return True
-        elif isinstance(entry, str) and entry.strip().lower() not in empty:
+        if not isinstance(entry, dict):
+            continue  # Unstructured text cannot reliably prove OTP delivery.
+        for field in ('code', 'otp', 'sms', 'text', 'body'):
+            value = entry.get(field)
+            if not isinstance(value, (str, int)) or isinstance(value, bool):
+                continue
+            content = str(value).strip()
+            if not content:
+                continue
+            lower = content.lower()
+            if any(phrase in lower for phrase in (
+                'waiting', 'pending', 'not received', 'no sms', 'no otp',
+                'not arrived', 'unknown', 'expired', 'cancelled', 'canceled'
+            )):
+                continue
+            if lower in ('none', 'null', 'false', '0', 'n/a', '-'):
+                continue
             return True
     return False
 
