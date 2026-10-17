@@ -2,7 +2,7 @@ import os, time, threading, collections, datetime, re
 import requests
 from flask import Flask, jsonify, render_template, request
 
-API_KEY = os.getenv('FOURSIM_API_KEY', '6155ce0f0d95e090ddceaba215eb7d30')
+API_KEY = os.getenv('FOURSIM_API_KEY', '14e85c47b09e50a92a2239e6aea7a481')
 DASHBOARD_TOKEN = os.getenv('DASHBOARD_TOKEN', '')
 CHECK_INTERVAL = 5
 CANCEL_THRESHOLD = 765
