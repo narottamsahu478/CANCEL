@@ -158,4 +158,4 @@ def stop():
     return jsonify(ok=True, message='Stop requested; active network request may take up to 15 seconds')
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5050, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False, threaded=True)
