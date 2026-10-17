@@ -1,12 +1,44 @@
-import os, time, threading, collections, datetime, re
+import os, time, threading, collections, datetime, re, json
 import requests
 from flask import Flask, jsonify, render_template, request
 
 API_KEYS = [os.getenv(f'FOURSIM_API_KEY_{i}', os.getenv('FOURSIM_API_KEY', '') if i == 1 else '') for i in range(1, 5)]
 DASHBOARD_TOKEN = os.getenv('DASHBOARD_TOKEN', '')
+KEY_STORE_PATH = os.getenv('KEY_STORE_PATH', '')  # e.g. /data/api_keys.json on a Railway volume
 CHECK_INTERVAL = 5
 CANCEL_THRESHOLD = 765
 MAX_RETRIES = 5
+def load_saved_keys():
+    if not KEY_STORE_PATH:
+        return
+    try:
+        with open(KEY_STORE_PATH, 'r', encoding='utf-8') as handle:
+            saved = json.load(handle)
+        if isinstance(saved, list):
+            for i, key in enumerate(saved[:4]):
+                if isinstance(key, str) and key and not API_KEYS[i]:
+                    API_KEYS[i] = key
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+def persist_keys(keys):
+    if not KEY_STORE_PATH:
+        return
+    directory = os.path.dirname(os.path.abspath(KEY_STORE_PATH))
+    os.makedirs(directory, exist_ok=True)
+    temporary = KEY_STORE_PATH + '.tmp'
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(keys, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, KEY_STORE_PATH)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+load_saved_keys()
 app = Flask(__name__)
 lock = threading.RLock()
 slot_events = [threading.Event() for _ in range(4)]
@@ -152,7 +184,7 @@ def status():
             remaining = seconds(item.get('expire'))
             item['status'] = ('Cancelled' if key in state['cancelled'] else 'Failed' if key in state['failed'] else 'Cancelling' if key in state['in_progress'] else 'Due' if remaining is not None and remaining <= CANCEL_THRESHOLD else 'Active')
             rows.append(item)
-        return jsonify(running=any(slot_running), api_running=list(slot_running), rows=rows, cancelled=len(state['cancelled']), failed=len(state['failed']), logs=list(state['logs'])[:70], last_sync=state['last_sync'], error=state['error'], threshold='12:45', interval=CHECK_INTERVAL, api_configured=[bool(k) for k in API_KEYS], api_errors=state['api_errors'])
+        return jsonify(running=any(slot_running), api_running=list(slot_running), rows=rows, cancelled=len(state['cancelled']), failed=len(state['failed']), logs=list(state['logs'])[:70], last_sync=state['last_sync'], error=state['error'], threshold='12:45', interval=CHECK_INTERVAL, api_configured=[bool(k) for k in API_KEYS], persistent_keys=bool(KEY_STORE_PATH), api_errors=state['api_errors'])
 
 @app.post('/api/keys/<int:slot>')
 def save_key(slot):
@@ -165,13 +197,19 @@ def save_key(slot):
     with lock:
         if slot_running[slot - 1]:
             return jsonify(error='Stop this API before changing its key'), 409
+        proposed = list(API_KEYS)
+        proposed[slot - 1] = key.strip()
+        try:
+            persist_keys(proposed)
+        except OSError:
+            return jsonify(error='Unable to persist API key; no changes saved'), 500
         API_KEYS[slot - 1] = key.strip()
         state['activations'] = [r for r in state['activations'] if r.get('api_slot') != slot]
         for name in ('cancelled', 'failed', 'in_progress'):
             state[name] = {x for x in state[name] if x[0] != slot}
         state['api_errors'][slot - 1] = ''
     log('info', f'API {slot} key updated (value hidden)')
-    return jsonify(ok=True, message=f'API {slot} saved for this server session')
+    return jsonify(ok=True, message=f'API {slot} saved' + (' persistently' if KEY_STORE_PATH else ' for this server session'))
 
 @app.post('/api/keys/<int:slot>/start')
 def start_slot(slot):
