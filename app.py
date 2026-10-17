@@ -12,7 +12,7 @@ lock = threading.RLock()
 stop_event = threading.Event()
 worker = None
 session = requests.Session()
-state = {'running': False, 'activations': [], 'cancelled': set(), 'failed': set(), 'protected': set(), 'in_progress': set(), 'logs': collections.deque(maxlen=250), 'last_sync': None, 'error': None}
+state = {'running': False, 'activations': [], 'cancelled': set(), 'failed': set(), 'protected': set(), 'provider_protected': set(), 'in_progress': set(), 'logs': collections.deque(maxlen=250), 'last_sync': None, 'error': None}
 
 def log(level, message):
     message = str(message).replace(API_KEY, '[REDACTED]') if API_KEY else str(message)
@@ -54,20 +54,27 @@ def otp_protected_response(result):
 
 
 def activation_has_sms(act):
-    """Protect activations whose getActivations record contains received SMS."""
+    """Only count an actual delivered SMS payload, not a placeholder entry."""
     sms = act.get('sms')
-    if isinstance(sms, list):
-        return len(sms) > 0
-    if isinstance(sms, dict):
-        return bool(sms)
-    if isinstance(sms, str):
-        return bool(sms.strip())
+    entries = sms if isinstance(sms, list) else [sms]
+    empty = {'', 'none', 'null', 'waiting', 'pending', 'no sms', 'no otp',
+             'waiting for the first sms', 'not received', 'false'}
+    for entry in entries:
+        if isinstance(entry, dict):
+            for field in ('sms', 'text', 'message', 'body', 'code', 'otp'):
+                value = entry.get(field)
+                if isinstance(value, (str, int)) and str(value).strip().lower() not in empty:
+                    return True
+        elif isinstance(entry, str) and entry.strip().lower() not in empty:
+            return True
     return False
 
 
 def protect(txn, reason):
     with lock:
         state['protected'].add(str(txn))
+        if 'provider' in reason:
+            state['provider_protected'].add(str(txn))
         state['failed'].discard(str(txn))
     log('info', f'Protected from cancellation: {txn} ({reason})')
 
@@ -145,6 +152,11 @@ def loop():
                         if not already_protected:
                             protect(txn, 'SMS present in activation')
                         continue
+                    # Clear stale protection from earlier placeholder-based detection.
+                    # Provider-confirmed refusals are kept protected separately.
+                    with lock:
+                        if txn in state['protected'] and txn not in state['provider_protected'] and not activation_has_sms(act):
+                            state['protected'].discard(txn)
                     remaining = seconds(act.get('expire'))
                     if not txn or remaining is None or remaining > CANCEL_THRESHOLD:
                         continue
