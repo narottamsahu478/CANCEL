@@ -12,7 +12,7 @@ lock = threading.RLock()
 stop_event = threading.Event()
 worker = None
 session = requests.Session()
-state = {'running': False, 'activations': [], 'cancelled': set(), 'failed': set(), 'in_progress': set(), 'logs': collections.deque(maxlen=250), 'last_sync': None, 'error': None}
+state = {'running': False, 'activations': [], 'cancelled': set(), 'failed': set(), 'protected': set(), 'in_progress': set(), 'logs': collections.deque(maxlen=250), 'last_sync': None, 'error': None}
 
 def log(level, message):
     message = str(message).replace(API_KEY, '[REDACTED]') if API_KEY else str(message)
@@ -34,6 +34,44 @@ def api_get(path, params):
     response.raise_for_status()
     return response.json()
 
+def otp_protected_response(result):
+    """Recognize provider refusals that indicate an SMS/OTP was received."""
+    if not isinstance(result, dict):
+        return False
+    parts = [str(result.get(k) or '') for k in ('message', 'error', 'detail', 'description', 'reason')]
+    nested = result.get('data')
+    if isinstance(nested, dict):
+        parts += [str(nested.get(k) or '') for k in ('message', 'error', 'reason')]
+    message = ' '.join(parts).lower()
+    return bool(re.search(
+        r'(?:otp|sms|code|message)\\s+(?:has\\s+been\\s+|already\\s+)?(?:received|arrived|delivered)'
+        r'|(?:received|got)\\s+(?:an?\\s+)?(?:otp|sms|verification\\s+code)'
+        r'|(?:otp|sms)\\s+(?:already\\s+)?(?:used|exists)'
+        r'|cannot\\s+cancel.{0,60}(?:otp|sms|code)'
+        r'|(?:otp|sms|code).{0,60}cannot\\s+cancel',
+        message
+    ))
+
+
+def activation_has_sms(act):
+    """Protect activations whose getActivations record contains received SMS."""
+    sms = act.get('sms')
+    if isinstance(sms, list):
+        return len(sms) > 0
+    if isinstance(sms, dict):
+        return bool(sms)
+    if isinstance(sms, str):
+        return bool(sms.strip())
+    return False
+
+
+def protect(txn, reason):
+    with lock:
+        state['protected'].add(str(txn))
+        state['failed'].discard(str(txn))
+    log('info', f'Protected from cancellation: {txn} ({reason})')
+
+
 def cancellation_accepted(result):
     if not isinstance(result, dict):
         return False
@@ -48,6 +86,9 @@ def cancel(txn):
             return
         try:
             result = api_get('cancelNumber', {'id': txn})
+            if otp_protected_response(result):
+                protect(txn, 'provider reports OTP/SMS received')
+                return
             if cancellation_accepted(result):
                 with lock:
                     state['cancelled'].add(str(txn))
@@ -60,6 +101,13 @@ def cancel(txn):
                 break
         except requests.HTTPError as exc:
             code = exc.response.status_code if exc.response is not None else None
+            try:
+                error_body = exc.response.json() if exc.response is not None else None
+            except ValueError:
+                error_body = {'message': exc.response.text[:500]} if exc.response is not None else None
+            if otp_protected_response(error_body):
+                protect(txn, 'provider HTTP response reports OTP/SMS received')
+                return
             log('error', f'Cancel {txn}, attempt {attempt}/{MAX_RETRIES}: HTTP {code}')
             if code is not None and 400 <= code < 500 and code not in (408, 429):
                 break
@@ -91,11 +139,17 @@ def loop():
                     if stop_event.is_set():
                         break
                     txn = str(act.get('id') or '')
+                    if txn and activation_has_sms(act):
+                        with lock:
+                            already_protected = txn in state['protected']
+                        if not already_protected:
+                            protect(txn, 'SMS present in activation')
+                        continue
                     remaining = seconds(act.get('expire'))
                     if not txn or remaining is None or remaining > CANCEL_THRESHOLD:
                         continue
                     with lock:
-                        if txn in state['cancelled'] or txn in state['in_progress'] or txn in state['failed']:
+                        if txn in state['cancelled'] or txn in state['in_progress'] or txn in state['failed'] or txn in state['protected']:
                             continue
                         state['in_progress'].add(txn)
                     try:
@@ -134,7 +188,7 @@ def status():
             item = dict(act)
             txn = str(item.get('id') or '')
             remaining = seconds(item.get('expire'))
-            item['status'] = ('Cancelled' if txn in state['cancelled'] else 'Failed' if txn in state['failed'] else 'Cancelling' if txn in state['in_progress'] else 'Due' if remaining is not None and remaining <= CANCEL_THRESHOLD else 'Active')
+            item['status'] = ('Cancelled' if txn in state['cancelled'] else 'OTP Received' if txn in state['protected'] or activation_has_sms(act) else 'Failed' if txn in state['failed'] else 'Cancelling' if txn in state['in_progress'] else 'Due' if remaining is not None and remaining <= CANCEL_THRESHOLD else 'Active')
             rows.append(item)
         return jsonify(running=state['running'], rows=rows, cancelled=len(state['cancelled']), failed=len(state['failed']), logs=list(state['logs'])[:70], last_sync=state['last_sync'], error=state['error'], threshold='12:45', interval=CHECK_INTERVAL)
 
